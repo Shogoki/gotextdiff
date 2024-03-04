@@ -1,159 +1,261 @@
-// Copyright 2019 The Go Authors. All rights reserved.
+// Copyright 2022 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// package gotextdiff supports a pluggable diff algorithm.
-package gotextdiff
+package diff
 
 import (
+	"bytes"
+	"fmt"
 	"sort"
 	"strings"
-
-	"github.com/hexops/gotextdiff/span"
 )
 
-// TextEdit represents a change to a section of a document.
-// The text within the specified span should be replaced by the supplied new text.
-type TextEdit struct {
-	Span    span.Span
-	NewText string
-}
+// A pair is a pair of values tracked for both the x and y side of a diff.
+// It is typically a pair of line indexes.
+type pair struct{ x, y int }
 
-// ComputeEdits is the type for a function that produces a set of edits that
-// convert from the before content to the after content.
-type ComputeEdits func(uri span.URI, before, after string) []TextEdit
-
-// SortTextEdits attempts to order all edits by their starting points.
-// The sort is stable so that edits with the same starting point will not
-// be reordered.
-func SortTextEdits(d []TextEdit) {
-	// Use a stable sort to maintain the order of edits inserted at the same position.
-	sort.SliceStable(d, func(i int, j int) bool {
-		return span.Compare(d[i].Span, d[j].Span) < 0
-	})
-}
-
-// ApplyEdits applies the set of edits to the before and returns the resulting
-// content.
-// It may panic or produce garbage if the edits are not valid for the provided
-// before content.
-func ApplyEdits(before string, edits []TextEdit) string {
-	// Preconditions:
-	//   - all of the edits apply to before
-	//   - and all the spans for each TextEdit have the same URI
-	if len(edits) == 0 {
-		return before
-	}
-	_, edits, _ = prepareEdits(before, edits)
-	after := strings.Builder{}
-	last := 0
-	for _, edit := range edits {
-		start := edit.Span.Start().Offset()
-		if start > last {
-			after.WriteString(before[last:start])
-			last = start
-		}
-		after.WriteString(edit.NewText)
-		last = edit.Span.End().Offset()
-	}
-	if last < len(before) {
-		after.WriteString(before[last:])
-	}
-	return after.String()
-}
-
-// LineEdits takes a set of edits and expands and merges them as necessary
-// to ensure that there are only full line edits left when it is done.
-func LineEdits(before string, edits []TextEdit) []TextEdit {
-	if len(edits) == 0 {
+// Diff returns an anchored diff of the two texts old and new
+// in the “unified diff” format. If old and new are identical,
+// Diff returns a nil slice (no output).
+//
+// Unix diff implementations typically look for a diff with
+// the smallest number of lines inserted and removed,
+// which can in the worst case take time quadratic in the
+// number of lines in the texts. As a result, many implementations
+// either can be made to run for a long time or cut off the search
+// after a predetermined amount of work.
+//
+// In contrast, this implementation looks for a diff with the
+// smallest number of “unique” lines inserted and removed,
+// where unique means a line that appears just once in both old and new.
+// We call this an “anchored diff” because the unique lines anchor
+// the chosen matching regions. An anchored diff is usually clearer
+// than a standard diff, because the algorithm does not try to
+// reuse unrelated blank lines or closing braces.
+// The algorithm also guarantees to run in O(n log n) time
+// instead of the standard O(n²) time.
+//
+// Some systems call this approach a “patience diff,” named for
+// the “patience sorting” algorithm, itself named for a solitaire card game.
+// We avoid that name for two reasons. First, the name has been used
+// for a few different variants of the algorithm, so it is imprecise.
+// Second, the name is frequently interpreted as meaning that you have
+// to wait longer (to be patient) for the diff, meaning that it is a slower algorithm,
+// when in fact the algorithm is faster than the standard one.
+func Diff(oldName string, old []byte, newName string, new []byte) []byte {
+	if bytes.Equal(old, new) {
 		return nil
 	}
-	c, edits, partial := prepareEdits(before, edits)
-	if partial {
-		edits = lineEdits(before, c, edits)
+	x := lines(old)
+	y := lines(new)
+
+	// Print diff header.
+	var out bytes.Buffer
+	fmt.Fprintf(&out, "diff %s %s\n", oldName, newName)
+	fmt.Fprintf(&out, "--- %s\n", oldName)
+	fmt.Fprintf(&out, "+++ %s\n", newName)
+
+	// Loop over matches to consider,
+	// expanding each match to include surrounding lines,
+	// and then printing diff chunks.
+	// To avoid setup/teardown cases outside the loop,
+	// tgs returns a leading {0,0} and trailing {len(x), len(y)} pair
+	// in the sequence of matches.
+	var (
+		done  pair     // printed up to x[:done.x] and y[:done.y]
+		chunk pair     // start lines of current chunk
+		count pair     // number of lines from each side in current chunk
+		ctext []string // lines for current chunk
+	)
+	for _, m := range tgs(x, y) {
+		if m.x < done.x {
+			// Already handled scanning forward from earlier match.
+			continue
+		}
+
+		// Expand matching lines as far as possible,
+		// establishing that x[start.x:end.x] == y[start.y:end.y].
+		// Note that on the first (or last) iteration we may (or definitely do)
+		// have an empty match: start.x==end.x and start.y==end.y.
+		start := m
+		for start.x > done.x && start.y > done.y && x[start.x-1] == y[start.y-1] {
+			start.x--
+			start.y--
+		}
+		end := m
+		for end.x < len(x) && end.y < len(y) && x[end.x] == y[end.y] {
+			end.x++
+			end.y++
+		}
+
+		// Emit the mismatched lines before start into this chunk.
+		// (No effect on first sentinel iteration, when start = {0,0}.)
+		for _, s := range x[done.x:start.x] {
+			ctext = append(ctext, "-"+s)
+			count.x++
+		}
+		for _, s := range y[done.y:start.y] {
+			ctext = append(ctext, "+"+s)
+			count.y++
+		}
+
+		// If we're not at EOF and have too few common lines,
+		// the chunk includes all the common lines and continues.
+		const C = 3 // number of context lines
+		if (end.x < len(x) || end.y < len(y)) &&
+			(end.x-start.x < C || (len(ctext) > 0 && end.x-start.x < 2*C)) {
+			for _, s := range x[start.x:end.x] {
+				ctext = append(ctext, " "+s)
+				count.x++
+				count.y++
+			}
+			done = end
+			continue
+		}
+
+		// End chunk with common lines for context.
+		if len(ctext) > 0 {
+			n := end.x - start.x
+			if n > C {
+				n = C
+			}
+			for _, s := range x[start.x : start.x+n] {
+				ctext = append(ctext, " "+s)
+				count.x++
+				count.y++
+			}
+			done = pair{start.x + n, start.y + n}
+
+			// Format and emit chunk.
+			// Convert line numbers to 1-indexed.
+			// Special case: empty file shows up as 0,0 not 1,0.
+			if count.x > 0 {
+				chunk.x++
+			}
+			if count.y > 0 {
+				chunk.y++
+			}
+			fmt.Fprintf(&out, "@@ -%d,%d +%d,%d @@\n", chunk.x, count.x, chunk.y, count.y)
+			for _, s := range ctext {
+				out.WriteString(s)
+			}
+			count.x = 0
+			count.y = 0
+			ctext = ctext[:0]
+		}
+
+		// If we reached EOF, we're done.
+		if end.x >= len(x) && end.y >= len(y) {
+			break
+		}
+
+		// Otherwise start a new chunk.
+		chunk = pair{end.x - C, end.y - C}
+		for _, s := range x[chunk.x:end.x] {
+			ctext = append(ctext, " "+s)
+			count.x++
+			count.y++
+		}
+		done = end
 	}
-	return edits
+
+	return out.Bytes()
 }
 
-// prepareEdits returns a sorted copy of the edits
-func prepareEdits(before string, edits []TextEdit) (*span.TokenConverter, []TextEdit, bool) {
-	partial := false
-	c := span.NewContentConverter("", []byte(before))
-	copied := make([]TextEdit, len(edits))
-	for i, edit := range edits {
-		edit.Span, _ = edit.Span.WithAll(c)
-		copied[i] = edit
-		partial = partial ||
-			edit.Span.Start().Offset() >= len(before) ||
-			edit.Span.Start().Column() > 1 || edit.Span.End().Column() > 1
+// lines returns the lines in the file x, including newlines.
+// If the file does not end in a newline, one is supplied
+// along with a warning about the missing newline.
+func lines(x []byte) []string {
+	l := strings.SplitAfter(string(x), "\n")
+	if l[len(l)-1] == "" {
+		l = l[:len(l)-1]
+	} else {
+		// Treat last line as having a message about the missing newline attached,
+		// using the same text as BSD/GNU diff (including the leading backslash).
+		l[len(l)-1] += "\n\\ No newline at end of file\n"
 	}
-	SortTextEdits(copied)
-	return c, copied, partial
+	return l
 }
 
-// lineEdits rewrites the edits to always be full line edits
-func lineEdits(before string, c *span.TokenConverter, edits []TextEdit) []TextEdit {
-	adjusted := make([]TextEdit, 0, len(edits))
-	current := TextEdit{Span: span.Invalid}
-	for _, edit := range edits {
-		if current.Span.IsValid() && edit.Span.Start().Line() <= current.Span.End().Line() {
-			// overlaps with the current edit, need to combine
-			// first get the gap from the previous edit
-			gap := before[current.Span.End().Offset():edit.Span.Start().Offset()]
-			// now add the text of this edit
-			current.NewText += gap + edit.NewText
-			// and then adjust the end position
-			current.Span = span.New(current.Span.URI(), current.Span.Start(), edit.Span.End())
-		} else {
-			// does not overlap, add previous run (if there is one)
-			adjusted = addEdit(before, adjusted, current)
-			// and then remember this edit as the start of the next run
-			current = edit
+// tgs returns the pairs of indexes of the longest common subsequence
+// of unique lines in x and y, where a unique line is one that appears
+// once in x and once in y.
+//
+// The longest common subsequence algorithm is as described in
+// Thomas G. Szymanski, “A Special Case of the Maximal Common
+// Subsequence Problem,” Princeton TR #170 (January 1975),
+// available at https://research.swtch.com/tgs170.pdf.
+func tgs(x, y []string) []pair {
+	// Count the number of times each string appears in a and b.
+	// We only care about 0, 1, many, counted as 0, -1, -2
+	// for the x side and 0, -4, -8 for the y side.
+	// Using negative numbers now lets us distinguish positive line numbers later.
+	m := make(map[string]int)
+	for _, s := range x {
+		if c := m[s]; c > -2 {
+			m[s] = c - 1
 		}
 	}
-	// add the current pending run if there is one
-	return addEdit(before, adjusted, current)
-}
+	for _, s := range y {
+		if c := m[s]; c > -8 {
+			m[s] = c - 4
+		}
+	}
 
-func addEdit(before string, edits []TextEdit, edit TextEdit) []TextEdit {
-	if !edit.Span.IsValid() {
-		return edits
-	}
-	// if edit is partial, expand it to full line now
-	start := edit.Span.Start()
-	end := edit.Span.End()
-	if start.Column() > 1 {
-		// prepend the text and adjust to start of line
-		delta := start.Column() - 1
-		start = span.NewPoint(start.Line(), 1, start.Offset()-delta)
-		edit.Span = span.New(edit.Span.URI(), start, end)
-		edit.NewText = before[start.Offset():start.Offset()+delta] + edit.NewText
-	}
-	if start.Offset() >= len(before) && start.Line() > 1 && before[len(before)-1] != '\n' {
-		// after end of file that does not end in eol, so join to last line of file
-		// to do this we need to know where the start of the last line was
-		eol := strings.LastIndex(before, "\n")
-		if eol < 0 {
-			// file is one non terminated line
-			eol = 0
+	// Now unique strings can be identified by m[s] = -1+-4.
+	//
+	// Gather the indexes of those strings in x and y, building:
+	//	xi[i] = increasing indexes of unique strings in x.
+	//	yi[i] = increasing indexes of unique strings in y.
+	//	inv[i] = index j such that x[xi[i]] = y[yi[j]].
+	var xi, yi, inv []int
+	for i, s := range y {
+		if m[s] == -1+-4 {
+			m[s] = len(yi)
+			yi = append(yi, i)
 		}
-		delta := len(before) - eol
-		start = span.NewPoint(start.Line()-1, 1, start.Offset()-delta)
-		edit.Span = span.New(edit.Span.URI(), start, end)
-		edit.NewText = before[start.Offset():start.Offset()+delta] + edit.NewText
 	}
-	if end.Column() > 1 {
-		remains := before[end.Offset():]
-		eol := strings.IndexRune(remains, '\n')
-		if eol < 0 {
-			eol = len(remains)
-		} else {
-			eol++
+	for i, s := range x {
+		if j, ok := m[s]; ok && j >= 0 {
+			xi = append(xi, i)
+			inv = append(inv, j)
 		}
-		end = span.NewPoint(end.Line()+1, 1, end.Offset()+eol)
-		edit.Span = span.New(edit.Span.URI(), start, end)
-		edit.NewText = edit.NewText + remains[:eol]
 	}
-	edits = append(edits, edit)
-	return edits
+
+	// Apply Algorithm A from Szymanski's paper.
+	// In those terms, A = J = inv and B = [0, n).
+	// We add sentinel pairs {0,0}, and {len(x),len(y)}
+	// to the returned sequence, to help the processing loop.
+	J := inv
+	n := len(xi)
+	T := make([]int, n)
+	L := make([]int, n)
+	for i := range T {
+		T[i] = n + 1
+	}
+	for i := 0; i < n; i++ {
+		k := sort.Search(n, func(k int) bool {
+			return T[k] >= J[i]
+		})
+		T[k] = J[i]
+		L[i] = k + 1
+	}
+	k := 0
+	for _, v := range L {
+		if k < v {
+			k = v
+		}
+	}
+	seq := make([]pair, 2+k)
+	seq[1+k] = pair{len(x), len(y)} // sentinel at end
+	lastj := n
+	for i := n - 1; i >= 0; i-- {
+		if L[i] == k && J[i] < lastj {
+			seq[k] = pair{xi[i], yi[J[i]]}
+			k--
+		}
+	}
+	seq[0] = pair{0, 0} // sentinel at start
+	return seq
 }

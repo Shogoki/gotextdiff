@@ -1,76 +1,43 @@
-package gotextdiff_test
+// Copyright 2022 The Go Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
+package diff
 
 import (
-	"fmt"
+	"bytes"
+	"internal/txtar"
+	"path/filepath"
 	"testing"
-
-	diff "github.com/hexops/gotextdiff"
-	"github.com/hexops/gotextdiff/difftest"
-	"github.com/hexops/gotextdiff/span"
 )
 
-func TestApplyEdits(t *testing.T) {
-	for _, tc := range difftest.TestCases {
-		t.Run(tc.Name, func(t *testing.T) {
-			t.Helper()
-			if got := diff.ApplyEdits(tc.In, tc.Edits); got != tc.Out {
-				t.Errorf("ApplyEdits edits got %q, want %q", got, tc.Out)
+func clean(text []byte) []byte {
+	text = bytes.ReplaceAll(text, []byte("$\n"), []byte("\n"))
+	text = bytes.TrimSuffix(text, []byte("^D\n"))
+	return text
+}
+
+func Test(t *testing.T) {
+	files, _ := filepath.Glob("testdata/*.txt")
+	if len(files) == 0 {
+		t.Fatalf("no testdata")
+	}
+
+	for _, file := range files {
+		t.Run(filepath.Base(file), func(t *testing.T) {
+			a, err := txtar.ParseFile(file)
+			if err != nil {
+				t.Fatal(err)
 			}
-			if tc.LineEdits != nil {
-				if got := diff.ApplyEdits(tc.In, tc.LineEdits); got != tc.Out {
-					t.Errorf("ApplyEdits lineEdits got %q, want %q", got, tc.Out)
-				}
+			if len(a.Files) != 3 || a.Files[2].Name != "diff" {
+				t.Fatalf("%s: want three files, third named \"diff\"", file)
+			}
+			diffs := Diff(a.Files[0].Name, clean(a.Files[0].Data), a.Files[1].Name, clean(a.Files[1].Data))
+			want := clean(a.Files[2].Data)
+			if !bytes.Equal(diffs, want) {
+				t.Fatalf("%s: have:\n%s\nwant:\n%s\n%s", file,
+					diffs, want, Diff("have", diffs, "want", want))
 			}
 		})
 	}
-}
-
-func TestLineEdits(t *testing.T) {
-	for _, tc := range difftest.TestCases {
-		t.Run(tc.Name, func(t *testing.T) {
-			t.Helper()
-			// if line edits not specified, it is the same as edits
-			edits := tc.LineEdits
-			if edits == nil {
-				edits = tc.Edits
-			}
-			if got := diff.LineEdits(tc.In, tc.Edits); diffEdits(got, edits) {
-				t.Errorf("LineEdits got %q, want %q", got, edits)
-			}
-		})
-	}
-}
-
-func TestUnified(t *testing.T) {
-	for _, tc := range difftest.TestCases {
-		t.Run(tc.Name, func(t *testing.T) {
-			t.Helper()
-			unified := fmt.Sprint(diff.ToUnified(difftest.FileA, difftest.FileB, tc.In, tc.Edits))
-			if unified != tc.Unified {
-				t.Errorf("edits got diff:\n%v\nexpected:\n%v", unified, tc.Unified)
-			}
-			if tc.LineEdits != nil {
-				unified := fmt.Sprint(diff.ToUnified(difftest.FileA, difftest.FileB, tc.In, tc.LineEdits))
-				if unified != tc.Unified {
-					t.Errorf("lineEdits got diff:\n%v\nexpected:\n%v", unified, tc.Unified)
-				}
-			}
-		})
-	}
-}
-
-func diffEdits(got, want []diff.TextEdit) bool {
-	if len(got) != len(want) {
-		return true
-	}
-	for i, w := range want {
-		g := got[i]
-		if span.Compare(w.Span, g.Span) != 0 {
-			return true
-		}
-		if w.NewText != g.NewText {
-			return true
-		}
-	}
-	return false
 }
